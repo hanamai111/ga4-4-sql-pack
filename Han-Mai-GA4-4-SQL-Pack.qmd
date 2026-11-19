@@ -1,0 +1,381 @@
+---
+title: "GA4-4 – SQL Pack"
+subtitle: "BigQuery GoogleSQL on GA4 Export Data"
+author: "Han Mai"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    embed-resources: true
+    code-fold: false
+    code-overflow: wrap
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Overview
+
+This individual Milestone 4 assignment demonstrates eight GoogleSQL analyses on GA4 event export data. The analyses use January 11–17, 2021, a complete Monday–Sunday window within the sample that keeps scans focused while covering the events needed for the analyses.
+
+The project GA4 export was not available as a usable BigQuery event table at the time of analysis, so this SQL Pack uses Google’s official GA4 obfuscated sample ecommerce export dataset to demonstrate and validate the required GoogleSQL patterns.
+
+# Dataset and Query Scope
+
+| Item | Value |
+| --- | --- |
+| Query execution project | `phd-orthodontics-ga4-bigquery` |
+| Source project | `bigquery-public-data` |
+| Dataset | `ga4_obfuscated_sample_ecommerce` |
+| Fully qualified wildcard | `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*` |
+| Available daily tables | 92, `events_20201101` through `events_20210131` |
+| Analysis window | January 11–17, 2021, inclusive |
+
+The PhD Orthodontics project displayed zero datasets in BigQuery Studio. The course assignment specifies GA4 export data without naming a required property. The source uses one `events_YYYYMMDD` table per day with one row per recorded event and repeated `event_params` key/value records. Before writing the pack, I checked the table dates, event frequencies, and populated parameter types for the selected week. The inventory confirmed string values for `page_location` and `currency`, integer values for `engagement_time_msec` and `ga_session_id`, and both integer and double storage for purchase `value` across events.
+
+# Required Skill Coverage
+
+| Query | Purpose | Filtering | Aggregation | UNNEST | CTE | Join/Combine |
+| --- | --- | --- | --- | --- | --- | --- |
+| Q1 | Daily page views and session-start events | ✓ | ✓ |  |  |  |
+| Q2 | Event volume and distinct pseudo-users | ✓ | ✓ |  |  |  |
+| Q3 | Top page URLs by views | ✓ | ✓ | ✓ | ✓ |  |
+| Q4 | Recorded engagement duration by device | ✓ | ✓ | ✓ | ✓ |  |
+| Q5 | Purchase event values by currency | ✓ | ✓ | ✓ | ✓ |  |
+| Q6 | Repeat page-view activity across days | ✓ | ✓ |  | ✓ |  |
+| Q7 | Purchase sessions by device | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Q8 | Ordered item-view-to-purchase funnel | ✓ | ✓ |  | ✓ | ✓ |
+
+Rubric audit — Filtering and scoping: **Yes (8)**. Grouping and aggregation: **Yes (8)**. Event parameter extraction: **Yes (4)**. CTEs: **Yes (6)**. Joins or combining: **Yes (2)**. Interpretation: **Yes (8)**.
+
+# Query 1 — Daily page views and session-start events
+
+## SQL
+
+```sql
+#standardSQL
+SELECT PARSE_DATE('%Y%m%d', event_date) AS day,
+  COUNTIF(event_name = 'page_view') AS page_views,
+  COUNTIF(event_name = 'session_start') AS session_start_events
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20210111' AND '20210117'
+  AND event_name IN ('page_view', 'session_start')
+GROUP BY day
+ORDER BY day
+```
+
+## Result
+
+| day | page views | session start events |
+| --- | --- | --- |
+| 2021-01-11 | 13159 | 3918 |
+| 2021-01-12 | 16693 | 4679 |
+| 2021-01-13 | 15653 | 4478 |
+| 2021-01-14 | 15534 | 4322 |
+| 2021-01-15 | 13841 | 3894 |
+| 2021-01-16 | 10556 | 3149 |
+| 2021-01-17 | 9563 | 2960 |
+
+## Interpretation
+
+BigQuery counts page-view and session-start event rows by export date. Both series peak on January 12, with 16,693 page views and 4,679 session-start events, and reach their weekly lows on January 17. The paired trend helps identify days when traffic volume shifts. Repeated session-start rows would contribute separately to the count.
+
+# Query 2 — Event volume and distinct pseudo-users
+
+## SQL
+
+```sql
+#standardSQL
+SELECT event_name, COUNT(*) AS event_count,
+  COUNT(DISTINCT NULLIF(user_pseudo_id, '')) AS pseudo_users
+FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20210111' AND '20210117'
+  AND event_name IN ('first_visit', 'view_item', 'view_search_results', 'purchase')
+GROUP BY event_name
+ORDER BY pseudo_users DESC, event_name
+```
+
+## Result
+
+| event name | event count | pseudo users |
+| --- | --- | --- |
+| first_visit | 21022 | 21010 |
+| view_item | 18502 | 4382 |
+| view_search_results | 1717 | 1114 |
+| purchase | 254 | 224 |
+
+## Interpretation
+
+For each selected event, the query counts event rows and distinct nonempty pseudo-user identifiers. Item views occurred 18,502 times across 4,382 pseudo-users, while 254 purchase rows represented 224 pseudo-users. The two columns distinguish action frequency from audience reach. A pseudo-user identifier generally represents a browser or device instance, and the same identifier can appear in multiple rows of this table across event types.
+
+# Query 3 — Top page URLs by views
+
+## SQL
+
+```sql
+#standardSQL
+WITH page_views AS (
+  SELECT (SELECT MAX(ep.value.string_value)
+     FROM UNNEST(event_params) AS ep WHERE ep.key = 'page_location') AS page_location
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20210111' AND '20210117'
+    AND event_name = 'page_view'
+)
+SELECT REGEXP_REPLACE(page_location, r'[?#].*$', '') AS page_url,
+  COUNT(*) AS views
+FROM page_views
+WHERE STARTS_WITH(page_location, 'https://')
+GROUP BY page_url
+ORDER BY views DESC, page_url
+LIMIT 5
+```
+
+## Result
+
+| page url | views |
+| --- | --- |
+| <https://shop.googlemerchandisestore.com/> | 16115 |
+| <https://googlemerchandisestore.com/> | 9826 |
+| <https://shop.googlemerchandisestore.com/Google+Redesign/Apparel> | 9563 |
+| <https://shop.googlemerchandisestore.com/store.html> | 5644 |
+| <https://shop.googlemerchandisestore.com/Google+Redesign/Apparel/Google+Dino+Game+Tee> | 3704 |
+
+## Interpretation
+
+This ranks the five most-viewed HTTPS page URLs after removing query strings and fragments from `page_location`. The shop subdomain’s homepage leads with 16,115 views, followed by the root-domain homepage at 9,826. The ranking identifies high-traffic pages for landing-page or navigation review. The normalization preserves separate hostnames and drops URL variants distinguished only by query or fragment.
+
+# Query 4 — Recorded engagement duration by device
+
+## SQL
+
+```sql
+#standardSQL
+WITH engagement AS (
+  SELECT device.category AS device_category,
+    (SELECT MAX(ep.value.int_value)
+     FROM UNNEST(event_params) AS ep WHERE ep.key = 'engagement_time_msec') AS engagement_ms
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20210111' AND '20210117'
+    AND event_name = 'user_engagement'
+)
+SELECT device_category, COUNT(*) AS engagement_events,
+  COUNT(engagement_ms) AS events_with_duration,
+  ROUND(AVG(engagement_ms) / 1000, 2) AS mean_seconds
+FROM engagement
+GROUP BY device_category
+ORDER BY engagement_events DESC, device_category
+```
+
+## Result
+
+| device category | engagement events | events with duration | mean seconds |
+| --- | --- | --- | --- |
+| desktop | 33664 | 32479 | 13.57 |
+| mobile | 23368 | 22565 | 13.81 |
+| tablet | 1249 | 1197 | 13.2 |
+
+## Interpretation
+
+The query extracts integer `engagement_time_msec` values from `user_engagement` events and averages recorded durations by device category. Mobile averages 13.81 seconds per populated event and desktop averages 13.57 seconds, while desktop has more engagement events overall. Reporting both event and duration counts helps assess parameter coverage before comparing devices. The average excludes missing durations and applies to populated events of this event type.
+
+# Query 5 — Purchase event values by currency
+
+## SQL
+
+```sql
+#standardSQL
+WITH purchase_values AS (
+  SELECT (SELECT MAX(ep.value.string_value)
+     FROM UNNEST(event_params) AS ep WHERE ep.key = 'currency') AS currency,
+    COALESCE((SELECT MAX(ep.value.double_value)
+     FROM UNNEST(event_params) AS ep WHERE ep.key = 'value'),
+             (SELECT MAX(ep.value.int_value)
+     FROM UNNEST(event_params) AS ep WHERE ep.key = 'value')) AS reported_value
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20210111' AND '20210117'
+    AND event_name = 'purchase'
+)
+SELECT currency, COUNT(*) AS purchase_events,
+  COUNT(reported_value) AS events_with_value,
+  ROUND(SUM(reported_value), 2) AS sum_reported_value,
+  ROUND(AVG(reported_value), 2) AS mean_reported_value
+FROM purchase_values
+GROUP BY currency
+ORDER BY purchase_events DESC, currency
+```
+
+## Result
+
+| currency | purchase events | events with value | sum reported value | mean reported value |
+| --- | --- | --- | --- | --- |
+| USD | 254 | 234 | 13194.72 | 56.39 |
+
+## Interpretation
+
+The query extracts `currency` as a string and uses the populated numeric slot for `value`, preferring double when both slots are present. Of 254 USD purchase events, 234 carried a numeric value, totaling USD 13,194.72 and averaging USD 56.39 per populated event. The counts help identify gaps in purchase-value tracking. These are recorded event values in an obfuscated export, and repeated purchase events contribute separately.
+
+# Query 6 — Repeat page-view activity across days
+
+## SQL
+
+```sql
+#standardSQL
+WITH daily_activity AS (
+  SELECT user_pseudo_id, COUNT(DISTINCT event_date) AS days_with_page_views
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20210111' AND '20210117'
+    AND event_name = 'page_view'
+    AND NULLIF(user_pseudo_id, '') IS NOT NULL
+  GROUP BY user_pseudo_id
+)
+SELECT days_with_page_views, COUNT(*) AS pseudo_users
+FROM daily_activity
+GROUP BY days_with_page_views
+ORDER BY days_with_page_views
+```
+
+## Result
+
+| days with page views | pseudo users |
+| --- | --- |
+| 1 | 22160 |
+| 2 | 899 |
+| 3 | 137 |
+| 4 | 21 |
+| 5 | 5 |
+
+## Interpretation
+
+The first step counts distinct page-view dates for each populated pseudo-user identifier, then the outer query counts identifiers at each frequency. There were 22,160 identifiers with page views on one day and 899 with page views on two days. The distribution distinguishes one-day activity from activity across multiple days within the week. The window hides any visits outside its boundaries.
+
+# Query 7 — Purchase sessions by device
+
+## SQL
+
+```sql
+#standardSQL
+WITH session_events AS (
+  SELECT user_pseudo_id, event_name, device.category AS device_category,
+    (SELECT MAX(ep.value.int_value)
+     FROM UNNEST(event_params) AS ep WHERE ep.key = 'ga_session_id') AS session_id
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20210111' AND '20210117'
+    AND event_name IN ('session_start', 'purchase')
+    AND NULLIF(user_pseudo_id, '') IS NOT NULL
+),
+started_sessions AS (
+  SELECT user_pseudo_id, session_id, MIN(device_category) AS device_category
+  FROM session_events
+  WHERE event_name = 'session_start' AND session_id IS NOT NULL
+  GROUP BY user_pseudo_id, session_id
+),
+purchase_sessions AS (
+  SELECT DISTINCT user_pseudo_id, session_id
+  FROM session_events
+  WHERE event_name = 'purchase' AND session_id IS NOT NULL
+)
+SELECT s.device_category, COUNT(*) AS started_sessions,
+  COUNT(p.session_id) AS sessions_with_purchase,
+  ROUND(100 * SAFE_DIVIDE(COUNT(p.session_id), COUNT(*)), 2) AS purchase_pct
+FROM started_sessions AS s
+LEFT JOIN purchase_sessions AS p USING (user_pseudo_id, session_id)
+GROUP BY s.device_category
+ORDER BY started_sessions DESC, s.device_category
+```
+
+## Result
+
+| device category | started sessions | sessions with purchase | purchase pct |
+| --- | --- | --- | --- |
+| desktop | 15740 | 129 | 0.82 |
+| mobile | 11041 | 92 | 0.83 |
+| tablet | 608 | 5 | 0.82 |
+
+## Interpretation
+
+The query joins deduplicated purchase sessions to sessions with a recorded `session_start` using the pair `user_pseudo_id` and `ga_session_id`. Mobile had 92 matched purchase sessions out of 11,041 starts (0.83%), and desktop had 129 out of 15,740 (0.82%). The matched shares support a device comparison with a consistent denominator. Purchases from sessions that began before the window are excluded when there is no matching start within the week.
+
+# Query 8 — Ordered item-view-to-purchase funnel
+
+## SQL
+
+```sql
+#standardSQL
+WITH stage_events AS (
+  SELECT user_pseudo_id, event_name, event_timestamp
+  FROM `bigquery-public-data.ga4_obfuscated_sample_ecommerce.events_*`
+WHERE _TABLE_SUFFIX BETWEEN '20210111' AND '20210117'
+    AND event_name IN ('view_item', 'add_to_cart', 'begin_checkout', 'purchase')
+    AND NULLIF(user_pseudo_id, '') IS NOT NULL
+),
+item_views AS (
+  SELECT user_pseudo_id, MIN(event_timestamp) AS viewed_at
+  FROM stage_events WHERE event_name = 'view_item'
+  GROUP BY user_pseudo_id
+),
+carts AS (
+  SELECT v.user_pseudo_id, MIN(e.event_timestamp) AS added_at
+  FROM item_views AS v JOIN stage_events AS e USING (user_pseudo_id)
+  WHERE e.event_name = 'add_to_cart' AND e.event_timestamp > v.viewed_at
+  GROUP BY v.user_pseudo_id
+),
+checkouts AS (
+  SELECT c.user_pseudo_id, MIN(e.event_timestamp) AS checkout_at
+  FROM carts AS c JOIN stage_events AS e USING (user_pseudo_id)
+  WHERE e.event_name = 'begin_checkout' AND e.event_timestamp > c.added_at
+  GROUP BY c.user_pseudo_id
+),
+purchases AS (
+  SELECT DISTINCT c.user_pseudo_id
+  FROM checkouts AS c JOIN stage_events AS e USING (user_pseudo_id)
+  WHERE e.event_name = 'purchase' AND e.event_timestamp > c.checkout_at
+),
+stage_counts AS (
+  SELECT 1 AS stage_order, 'Item view' AS stage, COUNT(*) AS pseudo_users FROM item_views
+  UNION ALL SELECT 2, 'Add to cart', COUNT(*) FROM carts
+  UNION ALL SELECT 3, 'Begin checkout', COUNT(*) FROM checkouts
+  UNION ALL SELECT 4, 'Purchase', COUNT(*) FROM purchases
+)
+SELECT stage, pseudo_users,
+  ROUND(100 * SAFE_DIVIDE(pseudo_users,
+    FIRST_VALUE(pseudo_users) OVER (ORDER BY stage_order)), 2) AS pct_of_item_viewers
+FROM stage_counts
+ORDER BY stage_order
+```
+
+## Result
+
+| stage | pseudo users | pct of item viewers |
+| --- | --- | --- |
+| Item view | 4382 | 100.0 |
+| Add to cart | 938 | 21.41 |
+| Begin checkout | 310 | 7.07 |
+| Purchase | 171 | 3.9 |
+
+## Interpretation
+
+This funnel follows each pseudo-user’s earliest qualifying timestamp at each successive stage, using strictly increasing timestamps. Of 4,382 item viewers, 938 reached the cart stage, 310 reached checkout, and 171 went on to purchase (3.90% of item viewers). The greatest absolute drop occurred between item view and add to cart, a useful starting point for further investigation. Stages can span sessions and products, and same-timestamp events do not qualify as sequential.
+
+# Overall Takeaways
+
+The pack uses constant suffix filters to scope GA4 daily tables, grouping to summarize event rows and pseudo-users, and typed extraction to read parameters without multiplying event rows. CTEs organize intermediate calculations, and joins connect purchases to a session key or enforce ordered user-level funnel stages. All eight displayed statements ran successfully in BigQuery using GoogleSQL, and a second run matched the recorded output for every query.
+
+# Appendix
+
+## GitHub Repository
+
+[https://github.com/hanamai111/ga4-4-sql-pack](https://github.com/hanamai111/ga4-4-sql-pack)
+
+## GitHub Pages
+
+[https://hanamai111.github.io/ga4-4-sql-pack/](https://hanamai111.github.io/ga4-4-sql-pack/)
+
+## SQL Reference Resources
+
+- [GA4 BigQuery sample ecommerce dataset](https://developers.google.com/analytics/bigquery/web-ecommerce-demo-dataset)
+- [GA4 Advanced Event Queries](https://developers.google.com/analytics/bigquery/advanced-queries)
+- [Google Analytics Audience Queries](https://support.google.com/analytics/answer/9037342?hl=en&ref_topic=9359001)
+
+Query design followed GA4 BigQuery patterns demonstrated in Google Analytics’ official BigQuery documentation and sample-query resources. All eight queries were adapted to the selected dataset and independently run and validated in BigQuery. Google’s purchase-session example informed the composite session key and mixed numeric extraction used in this pack.
+
